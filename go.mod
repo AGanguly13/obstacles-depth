@@ -7,7 +7,9 @@ toolchain go1.24.4
 require (
 	github.com/golang/geo v0.0.0-20230421003525-6adc56603217
 	github.com/pkg/errors v0.9.1
+	go.opencensus.io v0.24.0
 	go.viam.com/rdk v0.80.0
+	go.viam.com/utils v0.1.146
 )
 
 require (
@@ -130,7 +132,6 @@ require (
 	github.com/ziutek/mymysql v1.5.4 // indirect
 	go-hep.org/x/hep v0.32.1 // indirect
 	go.mongodb.org/mongo-driver v1.17.1 // indirect
-	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.54.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.54.0 // indirect
@@ -142,7 +143,6 @@ require (
 	go.uber.org/zap v1.27.0 // indirect
 	go.viam.com/api v0.1.438 // indirect
 	go.viam.com/test v1.2.4 // indirect
-	go.viam.com/utils v0.1.146 // indirect
 	golang.org/x/arch v0.18.0 // indirect
 	golang.org/x/crypto v0.38.0 // indirect
 	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e // indirect
