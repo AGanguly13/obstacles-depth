@@ -1,18 +1,20 @@
-# Module obstacles-depth 
+# Obstacles Depth Module
 
-Provide a description of the purpose of the module and any relevant information.
-
-## Model viam:obstacles-depth:obstacles-depth
-
-Provide a description of the model and any relevant information.
+This module provides a service for reading depth images from a depth camera and detecting obstacles in the environment by projecting them onto a point cloud and applying a point
+cloud clustering algorithm. 
 
 ### Configuration
 The following attribute template can be used to configure this model:
 
 ```json
 {
-"attribute_1": <float>,
-"attribute_2": <string>
+  "min_points_in_plane": 500,
+  "min_points_in_segment": 10,
+  "max_dist_from_plane_mm": 100,
+  "ground_angle_tolerance_degs": 30,
+  "clustering_radius": 1,
+  "clustering_strictness": 5,
+  "camera_name": "camera-1"
 }
 ```
 
@@ -22,29 +24,49 @@ The following attributes are available for this model:
 
 | Name          | Type   | Inclusion | Description                |
 |---------------|--------|-----------|----------------------------|
-| `attribute_1` | float  | Required  | Description of attribute 1 |
-| `attribute_2` | string | Optional  | Description of attribute 2 |
+| `min_points_in_plane` | float  | Required  | Minimum number of points in the plane |
+| `min_points_in_segment` | float | Required  | Minimum number of points in the segment |
+| `max_dist_from_plane_mm` | float | Required  | Maximum distance from the plane in mm |
+| `ground_angle_tolerance_degs` | float | Required  | Ground angle tolerance in degrees |
+| `clustering_radius` | float | Required  | Clustering radius in meters |
+| `clustering_strictness` | float | Required  | Clustering strictness level |
+| `camera_name` | string | Required  | Name of the camera to use |
 
-#### Example Configuration
+### Example Camera Configuration
 
 ```json
 {
-  "attribute_1": 1.0,
-  "attribute_2": "foo"
+  "name": "camera-2",
+  "api": "rdk:component:camera",
+  "model": "viam:camera:realsense",
+  "attributes": {
+    "width_px": 640,
+    "height_px": 480,
+    "little_endian_depth": false,
+    "serial_number": "",
+    "sensors": [
+      "depth",
+      "color"
+    ]
+  }
 }
 ```
 
-### DoCommand
-
-If your model implements DoCommand, provide an example payload of each command that is supported and the arguments that can be used. If your model does not implement DoCommand, remove this section.
-
-#### Example DoCommand
+### Example Module Configuration
 
 ```json
 {
-  "command_name": {
-    "arg1": "foo",
-    "arg2": 1
+  "name": "vision-1",
+  "api": "rdk:service:vision",
+  "model": "viam:vision:obstacles-depth",
+  "attributes": {
+    "min_points_in_plane": 500,
+    "min_points_in_segment": 10,
+    "max_dist_from_plane_mm": 100,
+    "ground_angle_tolerance_degs": 30,
+    "clustering_radius": 1,
+    "clustering_strictness": 5,
+    "camera_name": "camera-1"
   }
 }
 ```
