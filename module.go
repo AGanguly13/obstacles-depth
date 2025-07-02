@@ -1,137 +1,162 @@
+//go:build !no_cgo
+
+// Package obstaclesdepth uses an underlying depth camera to fulfill GetObjectPointClouds,
+// projecting its depth map to a point cloud, an then applying a point cloud clustering algorithm
 package obstaclesdepth
 
 import (
 	"context"
-	"image"
+	"sort"
 
+	"github.com/golang/geo/r3"
 	"github.com/pkg/errors"
+	"go.opencensus.io/trace"
+
+	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
-	"go.viam.com/rdk/services/vision"
-	vis "go.viam.com/rdk/vision"
-	"go.viam.com/rdk/vision/classification"
-	objdet "go.viam.com/rdk/vision/objectdetection"
-	"go.viam.com/rdk/vision/viscapture"
-	"go.viam.com/utils/rpc"
+	"go.viam.com/rdk/rimage"
+	"go.viam.com/rdk/rimage/depthadapter"
+	"go.viam.com/rdk/rimage/transform"
+	svision "go.viam.com/rdk/services/vision"
+	"go.viam.com/rdk/spatialmath"
+	vision "go.viam.com/rdk/vision"
+	"go.viam.com/rdk/vision/segmentation"
 )
 
-var (
-	ObstaclesDepth   = resource.NewModel("viam", "obstacles-depth", "obstacles-depth")
-	errUnimplemented = errors.New("unimplemented")
-)
+var ObstaclesDepth = resource.DefaultModelFamily.WithModel("obstacles_depth")
 
 func init() {
-	resource.RegisterService(vision.API, ObstaclesDepth,
-		resource.Registration[vision.Service, *Config]{
-			Constructor: newObstaclesDepthObstaclesDepth,
-		},
-	)
-}
-
-type Config struct {
-	/*
-		Put config attributes here. There should be public/exported fields
-		with a `json` parameter at the end of each attribute.
-
-		Example config struct:
-			type Config struct {
-				Pin   string `json:"pin"`
-				Board string `json:"board"`
-				MinDeg *float64 `json:"min_angle_deg,omitempty"`
+	resource.RegisterService(svision.API, ObstaclesDepth, resource.Registration[svision.Service, *ObsDepthConfig]{
+		Constructor: func(
+			ctx context.Context, deps resource.Dependencies, c resource.Config, logger logging.Logger,
+		) (svision.Service, error) {
+			attrs, err := resource.NativeConfig[*ObsDepthConfig](c)
+			if err != nil {
+				return nil, err
 			}
-
-		If your model does not need a config, replace *Config in the init
-		function with resource.NoNativeConfig
-	*/
+			return registerObstaclesDepth(ctx, c.ResourceName(), attrs, deps, logger)
+		},
+	})
 }
 
-// Validate ensures all parts of the config are valid and important fields exist.
-// Returns implicit required (first return) and optional (second return) dependencies based on the config.
-// The path is the JSON path in your robot's config (not the `Config` struct) to the
-// resource being validated; e.g. "components.0".
-func (cfg *Config) Validate(path string) ([]string, []string, error) {
-	// Add config validation code here
-	return nil, nil, nil
+// ObsDepthConfig specifies the parameters to be used for the obstacle depth service.
+type ObsDepthConfig struct {
+	resource.TriviallyValidateConfig
+	MinPtsInPlane        int     `json:"min_points_in_plane"`
+	MinPtsInSegment      int     `json:"min_points_in_segment"`
+	MaxDistFromPlane     float64 `json:"max_dist_from_plane_mm"`
+	ClusteringRadius     int     `json:"clustering_radius"`
+	ClusteringStrictness float64 `json:"clustering_strictness"`
+	AngleTolerance       float64 `json:"ground_angle_tolerance_degs"`
+	DefaultCamera        string  `json:"camera_name"`
 }
 
-type obstaclesDepthObstaclesDepth struct {
-	resource.AlwaysRebuild
-
-	name resource.Name
-
-	logger logging.Logger
-	cfg    *Config
-
-	cancelCtx  context.Context
-	cancelFunc func()
+// obsDepth is the underlying struct actually used by the service.
+type obsDepth struct {
+	clusteringConf *segmentation.ErCCLConfig
+	intrinsics     *transform.PinholeCameraIntrinsics
 }
 
-func newObstaclesDepthObstaclesDepth(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (vision.Service, error) {
-	conf, err := resource.NativeConfig[*Config](rawConf)
+func registerObstaclesDepth(
+	ctx context.Context,
+	name resource.Name,
+	conf *ObsDepthConfig,
+	deps resource.Dependencies,
+	logger logging.Logger,
+) (svision.Service, error) {
+	_, span := trace.StartSpan(ctx, "service::vision::registerObstacleDepth")
+	defer span.End()
+	if conf == nil {
+		return nil, errors.New("config for obstacles_depth cannot be nil")
+	}
+	// build the clustering config
+	cfg := &segmentation.ErCCLConfig{
+		MinPtsInPlane:        conf.MinPtsInPlane,
+		MinPtsInSegment:      conf.MinPtsInSegment,
+		MaxDistFromPlane:     conf.MaxDistFromPlane,
+		NormalVec:            r3.Vector{0, -1, 0},
+		AngleTolerance:       conf.AngleTolerance,
+		ClusteringRadius:     conf.ClusteringRadius,
+		ClusteringStrictness: conf.ClusteringStrictness,
+	}
+	err := cfg.CheckValid()
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error building clustering config for obstacles_depth")
+	}
+	myObsDep := &obsDepth{
+		clusteringConf: cfg,
+	}
+	if conf.DefaultCamera != "" {
+		_, err = camera.FromDependencies(deps, conf.DefaultCamera)
+		if err != nil {
+			return nil, errors.Errorf("could not find camera %q", conf.DefaultCamera)
+		}
 	}
 
-	return NewObstaclesDepth(ctx, deps, rawConf.ResourceName(), conf, logger)
-
+	segmenter := myObsDep.buildObsDepth(logger) // does the thing
+	return svision.NewService(name, deps, logger, nil, nil, nil, segmenter, conf.DefaultCamera)
 }
 
-func NewObstaclesDepth(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (vision.Service, error) {
-
-	cancelCtx, cancelFunc := context.WithCancel(context.Background())
-
-	s := &obstaclesDepthObstaclesDepth{
-		name:       name,
-		logger:     logger,
-		cfg:        conf,
-		cancelCtx:  cancelCtx,
-		cancelFunc: cancelFunc,
+// BuildObsDepth will check for intrinsics and determine how to build based on that.
+func (o *obsDepth) buildObsDepth(logger logging.Logger) func(
+	ctx context.Context, src camera.Camera) ([]*vision.Object, error) {
+	return func(ctx context.Context, src camera.Camera) ([]*vision.Object, error) {
+		props, err := src.Properties(ctx)
+		if err != nil {
+			logger.CWarnw(ctx, "could not find camera properties. obstacles depth started without camera's intrinsic parameters", "error", err)
+			return o.obsDepthNoIntrinsics(ctx, src)
+		}
+		if props.IntrinsicParams == nil {
+			logger.CWarn(ctx, "obstacles depth started but camera did not have intrinsic parameters")
+			return o.obsDepthNoIntrinsics(ctx, src)
+		}
+		o.intrinsics = props.IntrinsicParams
+		return o.obsDepthWithIntrinsics(ctx, src)
 	}
-	return s, nil
 }
 
-func (s *obstaclesDepthObstaclesDepth) Name() resource.Name {
-	return s.name
+// buildObsDepthNoIntrinsics will return the median depth in the depth map as a Geometry point.
+func (o *obsDepth) obsDepthNoIntrinsics(ctx context.Context, src camera.Camera) ([]*vision.Object, error) {
+	img, err := camera.DecodeImageFromCamera(ctx, "", nil, src)
+	if err != nil {
+		return nil, errors.Errorf("could not get image from %s", src)
+	}
+
+	dm, err := rimage.ConvertImageToDepthMap(ctx, img)
+	if err != nil {
+		return nil, errors.New("could not convert image to depth map")
+	}
+	depData := dm.Data()
+	if len(depData) == 0 {
+		return nil, errors.New("could not get info from depth map")
+	}
+	// Sort the depth data [smallest...largest]
+	sort.Slice(depData, func(i, j int) bool {
+		return depData[i] < depData[j]
+	})
+	med := int(0.5 * float64(len(depData)))
+	pt := spatialmath.NewPoint(r3.Vector{X: 0, Y: 0, Z: float64(depData[med])}, "")
+	toReturn := make([]*vision.Object, 1)
+	toReturn[0] = &vision.Object{Geometry: pt}
+	return toReturn, nil
 }
 
-func (s *obstaclesDepthObstaclesDepth) NewClientFromConn(ctx context.Context, conn rpc.ClientConn, remoteName string, name resource.Name, logger logging.Logger) (vision.Service, error) {
-	panic("not implemented")
-}
-
-func (s *obstaclesDepthObstaclesDepth) DetectionsFromCamera(ctx context.Context, cameraName string, extra map[string]interface{}) ([]objdet.Detection, error) {
-	panic("not implemented")
-}
-
-func (s *obstaclesDepthObstaclesDepth) Detections(ctx context.Context, img image.Image, extra map[string]interface{}) ([]objdet.Detection, error) {
-	panic("not implemented")
-}
-
-func (s *obstaclesDepthObstaclesDepth) ClassificationsFromCamera(ctx context.Context, cameraName string, n int, extra map[string]interface{}) (classification.Classifications, error) {
-	panic("not implemented")
-}
-
-func (s *obstaclesDepthObstaclesDepth) Classifications(ctx context.Context, img image.Image, n int, extra map[string]interface{}) (classification.Classifications, error) {
-	panic("not implemented")
-}
-
-func (s *obstaclesDepthObstaclesDepth) GetObjectPointClouds(ctx context.Context, cameraName string, extra map[string]interface{}) ([]*vis.Object, error) {
-	panic("not implemented")
-}
-
-func (s *obstaclesDepthObstaclesDepth) GetProperties(ctx context.Context, extra map[string]interface{}) (*vision.Properties, error) {
-	panic("not implemented")
-}
-
-func (s *obstaclesDepthObstaclesDepth) CaptureAllFromCamera(ctx context.Context, cameraName string, captureOptions viscapture.CaptureOptions, extra map[string]interface{}) (viscapture.VisCapture, error) {
-	panic("not implemented")
-}
-
-func (s *obstaclesDepthObstaclesDepth) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-	panic("not implemented")
-}
-
-func (s *obstaclesDepthObstaclesDepth) Close(context.Context) error {
-	// Put close code here
-	s.cancelFunc()
-	return nil
+// buildObsDepthWithIntrinsics will use the methodology in Manduchi et al. to find obstacle points
+// before clustering and projecting those points into 3D obstacles.
+func (o *obsDepth) obsDepthWithIntrinsics(ctx context.Context, src camera.Camera) ([]*vision.Object, error) {
+	// Check if we have intrinsics here. If not, don't even try
+	if o.intrinsics == nil {
+		return nil, errors.New("tried to build obstacles depth with intrinsics but no instrinsics found")
+	}
+	img, err := camera.DecodeImageFromCamera(ctx, "", nil, src)
+	if err != nil {
+		return nil, errors.Errorf("could not get image from %s", src)
+	}
+	dm, err := rimage.ConvertImageToDepthMap(ctx, img)
+	if err != nil {
+		return nil, errors.New("could not convert image to depth map")
+	}
+	cloud := depthadapter.ToPointCloud(dm, o.intrinsics)
+	return segmentation.ApplyERCCLToPointCloud(ctx, cloud, o.clusteringConf)
 }
